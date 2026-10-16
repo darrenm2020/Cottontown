@@ -65,6 +65,8 @@ button:focus-visible{outline:3px solid var(--sel);outline-offset:2px}
 .gbtn[aria-pressed="true"] small{color:rgba(255,255,255,.85)}
 .clockbox{display:flex;align-items:center;gap:14px}
 .clockface{display:flex;flex-direction:column;align-items:flex-end}
+.sync{font:600 12px/1 "Barlow",sans-serif;padding:3px 8px;border-radius:20px;margin-bottom:4px;background:var(--surface-2);color:var(--muted)}
+.sync.run{background:#e3f3e7;color:#14532d}.sync.view{background:#e4ecfb;color:#1e3a8a}.sync.lost{background:#fdf1dc;color:#7a3d00}
 .period{font:600 15px/1 "Barlow Condensed","Arial Narrow",sans-serif;color:var(--muted)}
 .time{font:700 clamp(48px,6.4vw,78px)/.92 "Barlow Condensed","Arial Narrow",sans-serif;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
 .next{display:flex;flex-direction:column;align-items:flex-start;padding:6px 12px;border-radius:12px;background:var(--surface-2);border:1.5px solid var(--line);min-width:118px}
@@ -83,6 +85,8 @@ button:focus-visible{outline:3px solid var(--sel);outline-offset:2px}
 .btn.primary.pause{background:var(--ink);border-color:var(--ink);color:var(--surface)}
 .btn.small{min-height:40px;padding:6px 12px;font-size:17px}
 .adjrow{grid-column:1/-1;display:flex;gap:8px;justify-content:flex-end;align-items:center;flex-wrap:wrap}
+.btn.danger-s{color:var(--crimson);border-color:var(--crimson);background:transparent}.btn.danger-s.armed{background:var(--crimson);color:#fff}
+.codebox{display:flex;gap:8px;margin-top:8px}.codebox input{flex:1;min-width:0;min-height:44px;border-radius:10px;border:1.5px solid var(--line);background:var(--surface);color:var(--ink);font:600 18px "Barlow",sans-serif;padding:0 12px}
 .adjrow span{color:var(--muted);font-size:14px;margin-right:4px}
 
 /* Banner */
@@ -254,7 +258,7 @@ button.cell.picked{border:2px solid var(--crimson)}
     </div>
     <nav class="games" id="games" aria-label="Games"></nav>
     <div class="clockbox">
-      <div class="clockface"><div class="period" id="period"></div><div class="time" id="time">00:00</div></div>
+      <div class="clockface"><div class="sync" id="sync" hidden></div><div class="period" id="period"></div><div class="time" id="time">00:00</div></div>
       <div class="next" id="next"></div>
     </div>
     <div class="ctrl" id="ctrl"></div>
@@ -348,11 +352,72 @@ function load(){
   }catch(e){}
   return fresh();
 }
-function save(){try{localStorage.setItem(KEY,JSON.stringify(S));}catch(e){}}
+function saveLocal(){try{localStorage.setItem(KEY,JSON.stringify(S));}catch(e){}}
+function save(){saveLocal();
+  if(SY.on&&S.editor)S.games.forEach((g,i)=>{const js=JSON.stringify(g);if(js!==SY.lastSent[i]){SY.editT[i]=Date.now();push(i);}});}
+/* Live sync (works when hosted on Netlify with the /api/state function) */
+const SY={on:false,ok:false,lastSent:[],rev:[],inflight:[],editT:[],first:true};
+const canEdit=()=>!SY.on||!!S.editor;
+function fixGame(g,i){if(!Array.isArray(g.plan))g.plan=clonePlan(i);if(!Array.isArray(g.alerted))g.alerted=[];if(!Array.isArray(g.events))g.events=[];return g;}
+function applyServer(j){
+  const games=Array.isArray(j.games)?j.games:[];let changed=false;
+  GAMES.forEach((_,i)=>{const sg=games[i];
+    if(!sg||!sg.game){if(SY.first&&S.editor){SY.lastSent[i]='';}return;}
+    if(SY.inflight[i]||Date.now()-(SY.editT[i]||0)<1500)return;
+    if(!SY.first&&(SY.rev[i]||0)>=sg.rev)return;
+    SY.rev[i]=sg.rev;
+    if(JSON.stringify(sg.game)!==JSON.stringify(S.games[i])){S.games[i]=fixGame(sg.game,i);changed=true;}
+    SY.lastSent[i]=JSON.stringify(S.games[i]);
+  });
+  const wasFirst=SY.first;SY.first=false;
+  if(changed){saveLocal();UI.win=undefined;renderAll();}
+  if(wasFirst&&S.editor)save();
+}
+async function getState(){
+  const t0=Date.now();const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw new Error('bad');
+  const j=await r.json();if(!j||typeof j.now!=='number')throw new Error('bad');
+  const off=j.now-Math.round((t0+Date.now())/2);OFF=SY.on?Math.round(OFF*0.8+off*0.2):off;return j;
+}
+async function syncInit(){
+  try{const j=await getState();SY.on=true;SY.ok=true;if(S.editor===undefined)S.editor=false;applyServer(j);setInterval(poll,2000);}
+  catch(e){SY.on=false;}
+  renderAll();
+}
+async function poll(){
+  if(document.visibilityState!=='visible')return;
+  try{const j=await getState();SY.ok=true;applyServer(j);}catch(e){SY.ok=false;}
+  renderSync();
+}
+async function unlock(){
+  const el=document.getElementById('code');const code=el?el.value.trim():'';
+  if(!code){say('Enter the coach code first');renderHint();return;}
+  try{const r=await fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({verify:true,code})});
+    if(r.ok){S.code=code;S.editor=true;S.games.forEach((x,i)=>{SY.lastSent[i]=JSON.stringify(x);});saveLocal();say('Unlocked. This device runs the subs.');}
+    else if(r.status===401)say('That code didn’t work');
+    else say('Couldn’t check the code. Try again.');
+  }catch(e){say('Couldn’t reach the server. Try again.');}
+  renderAll();
+}
+async function push(i){
+  if(!SY.on||!S.editor)return;
+  SY.lastSent[i]=JSON.stringify(S.games[i]);SY.inflight[i]=(SY.inflight[i]||0)+1;
+  try{const r=await fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({i,game:S.games[i],code:S.code||''})});
+    if(r.status===401){S.editor=false;S.code='';saveLocal();say('Coach code was not accepted. This device is now view only.');SY.inflight[i]--;renderAll();return;}
+    if(r.ok){const j=await r.json();if(j.rev>(SY.rev[i]||0))SY.rev[i]=j.rev;SY.ok=true;}else SY.ok=false;}
+  catch(e){SY.ok=false;SY.lastSent[i]='';}
+  SY.inflight[i]--;SY.editT[i]=Date.now();renderSync();
+}
+function renderSync(){
+  const el=document.getElementById('sync');if(!el)return;
+  if(!SY.on){el.hidden=true;return;}
+  el.hidden=false;el.className='sync '+(SY.ok?(canEdit()?'run':'view'):'lost');
+  el.textContent=SY.ok?(canEdit()?'Live: running subs':'Live: view only'):'Sync lost, retrying';
+}
 
 const G=()=>S.games[S.cur];
 const PL=()=>G().plan;
-const clock=g=>g.acc+(g.running?Date.now()-g.runStart:0);
+let OFF=0;const T=()=>Date.now()+OFF;
+const clock=g=>g.acc+(g.running?T()-g.runStart:0);
 const HMS=g=>g.half*60000, SMS=g=>g.sub*60000;
 function fmt(ms){ms=Math.max(0,ms);const s=Math.floor(ms/1000);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0');}
 function fmtClock(ms){ms=Math.max(0,ms);const s=Math.floor(ms/1000);return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');}
@@ -463,12 +528,12 @@ function pickSet(id){
 function play(){
   const g=G();if(g.fullDone)return;unlockAudio();
   if(g.running){g.acc=clock(g);g.running=false;}
-  else{g.started=true;g.runStart=Date.now();g.running=true;wake();}
+  else{g.started=true;g.runStart=T();g.running=true;wake();}
   save();renderAll();
 }
 function adjust(delta){
   const g=G();const H=HMS(g);const c=Math.min(2*H,Math.max(0,clock(g)+delta));
-  g.acc=c;if(g.running)g.runStart=Date.now();
+  g.acc=c;if(g.running)g.runStart=T();
   g.halfDone=c>=H&&(g.halfDone||c>H);if(c<H)g.halfDone=false;
   g.fullDone=c>=2*H;if(g.fullDone)g.running=false;
   g.alerted=g.alerted.filter(i=>i*SMS(g)<=c);
@@ -479,9 +544,13 @@ function undo(){
   const g=G();if(!g.events.length)return;const last=g.events[g.events.length-1].b;
   g.events=g.events.filter(e=>e.b!==last);say('Last change undone');save();renderAll();
 }
+const VIEW_OK=new Set(['game','tab','beep','editor','unlock','cancel','pickcancel']);
 function act(a,ds){
   const g=G();
+  if(!canEdit()&&!VIEW_OK.has(a)){say('View only. To run subs from this device, turn it on in the Players tab.');renderHint();return;}
   switch(a){
+    case 'editor':S.editor=false;S.code='';saveLocal();say('This device is now view only');break;
+    case 'unlock':unlock();return;
     case 'game':S.cur=+ds.i;UI.sel=null;UI.adj=false;UI.pick=null;UI.win=undefined;save();break;
     case 'tab':S.tab=ds.t;save();break;
     case 'play':play();return;
@@ -509,7 +578,7 @@ function act(a,ds){
     case 'beep':S.beep=!S.beep;if(S.beep){unlockAudio();lastAlarm=0;alarm();}save();break;
     case 'reset':
       if(UI.resetArm&&Date.now()-UI.resetArm<4000){S.games[S.cur]=freshGame(S.cur,g);UI.pick=null;UI.resetArm=0;UI.sel=null;say(GAMES[S.cur].title+' reset');save();}
-      else{UI.resetArm=Date.now();setTimeout(()=>{if(UI.resetArm&&Date.now()-UI.resetArm>=4000){UI.resetArm=0;renderPanel();}},4100);}
+      else{UI.resetArm=Date.now();setTimeout(()=>{if(UI.resetArm&&Date.now()-UI.resetArm>=4000){UI.resetArm=0;renderPanel();renderCtrl();}},4100);}
       break;
   }
   renderAll();
@@ -549,6 +618,7 @@ function renderClock(){
 }
 function renderCtrl(){
   const g=G();const c=clock(g);
+  if(!canEdit()){$('ctrl').innerHTML='';$('adjrow').hidden=true;return;}
   let label='Resume',cls='btn primary';
   if(g.running){label='Pause';cls+=' pause';}
   else if(g.fullDone)label='Final';
@@ -560,7 +630,8 @@ function renderCtrl(){
   const ar=$('adjrow');if(!g.started)UI.adj=false;ar.hidden=!UI.adj;
   if(UI.adj)ar.innerHTML=`<span>Nudge the clock to match the ref</span>
     <button class="btn small" data-act="adj" data-d="-60">−1:00</button><button class="btn small" data-act="adj" data-d="-10">−0:10</button>
-    <button class="btn small" data-act="adj" data-d="10">+0:10</button><button class="btn small" data-act="adj" data-d="60">+1:00</button>`;
+    <button class="btn small" data-act="adj" data-d="10">+0:10</button><button class="btn small" data-act="adj" data-d="60">+1:00</button>
+    <button class="btn small danger-s ${UI.resetArm&&Date.now()-UI.resetArm<4000?'armed':''}" data-act="reset">${UI.resetArm&&Date.now()-UI.resetArm<4000?'Tap again to reset':'Reset '+esc(GAMES[S.cur].title)}</button>`;
 }
 function renderBanner(){
   const g=G();const el=$('banner');
@@ -572,7 +643,7 @@ function renderBanner(){
     :'<span>The field already matches the plan.</span>';
   el.innerHTML=`<div class="banner" role="status"><div><h2>${title}</h2><p>${lines.length?lines.length+' change'+(lines.length>1?'s':''):'No changes needed'}</p></div>
     <div class="chg">${chips}</div>
-    <div class="acts">${lines.length?`<button class="btn" data-act="apply" data-k="${k}">Make planned subs</button>`:''}
+    <div class="acts" ${canEdit()?'':'hidden'}>${lines.length?`<button class="btn" data-act="apply" data-k="${k}">Make planned subs</button>`:''}
     <button class="btn ghost" data-act="editplan">Change plan</button><button class="btn ghost" data-act="dismiss">${lines.length?'Skip':'OK'}</button></div></div>`;
 }
 const LINES=`<svg viewBox="0 0 68 100" preserveAspectRatio="none" aria-hidden="true"><g fill="none" stroke="rgba(255,255,255,.6)" stroke-width="1.5" vector-effect="non-scaling-stroke">
@@ -673,7 +744,12 @@ function renderPlan(d){
   return h;
 }
 function renderPlayers(d){
-  const g=G();let h=`<h3>${esc(GAMES[S.cur].title)}: who’s here</h3><p class="fine" style="margin-top:-4px">${esc(GAMES[S.cur].note)}. Tap Here or Out to change it.</p>`;
+  const g=G();let h='';
+  if(SY.on){
+    if(S.editor)h+=`<h3>Coach controls</h3><div class="set"><span>This device runs the subs. Everyone else with the link sees changes live.</span><button class="btn small" data-act="editor">Lock</button></div>`;
+    else h+=`<h3>Coach controls</h3><p class="fine" style="margin-top:-4px">You’re following along. Coaches can enter the coach code to run subs from this device.</p><div class="codebox"><input id="code" type="password" autocomplete="off" placeholder="Coach code" aria-label="Coach code"><button class="btn small" data-act="unlock">Unlock</button></div>`;
+  }
+  h+=`<h3>${esc(GAMES[S.cur].title)}: who’s here</h3><p class="fine" style="margin-top:-4px">${esc(GAMES[S.cur].note)}. Tap Here or Out to change it.</p>`;
   PLAYERS.forEach(p=>{const here=g.avail[p.id];const pos=POS.find(x=>d.L[x]===p.id);const s=d.st[p.id];
     const stat=pos?`On at ${pos}`:here?`Bench <span data-lv="sit" data-id="${p.id}">${fmt(d.now-s.offAt)}</span>`:'Out';
     const pm=here?plannedMin(p.id):0;
@@ -682,12 +758,13 @@ function renderPlayers(d){
       <div class="pmin"><b data-lv="played" data-id="${p.id}">${fmt(s.played)}</b><small>${here?pm+' min planned':'played'}</small></div>
       <button class="tog ${here?'on':''}" data-act="avail" data-id="${p.id}" aria-pressed="${here}">${here?'Here':'Out'}</button></div>`;});
   const armed=UI.resetArm&&Date.now()-UI.resetArm<4000;
+  if(!canEdit())return h;
   h+=`<h3>Game settings</h3>
    <div class="set"><span>Half length</span><div class="step"><button data-act="set" data-key="half" data-d="-1" aria-label="Shorter half">−</button><b>${g.half} min</b><button data-act="set" data-key="half" data-d="1" aria-label="Longer half">+</button></div></div>
    <div class="set"><span>Sub every</span><div class="step"><button data-act="set" data-key="sub" data-d="-1" aria-label="Shorter interval">−</button><b>${g.sub} min</b><button data-act="set" data-key="sub" data-d="1" aria-label="Longer interval">+</button></div></div>
    <div class="set"><span>Sub alert sound</span><button class="tog ${S.beep?'on':''}" data-act="beep" aria-pressed="${S.beep}">${S.beep?'On':'Off'}</button></div>
    <button class="btn danger ${armed?'armed':''}" data-act="reset">${armed?'Tap again to reset '+esc(GAMES[S.cur].title):'Reset '+esc(GAMES[S.cur].title)}</button>
-   <p class="fine">Everything saves in this browser on this iPad. Resetting clears the clock, subs and log for this game only; who’s here stays as you set it.</p>`;
+   <p class="fine">${SY.on?'Changes from the device running subs show up on every phone within a couple of seconds.':'Everything saves in this browser on this device.'} Resetting clears the clock, subs and log for this game only; who’s here stays as you set it.</p>`;
   return h;
 }
 function renderLog(d){
@@ -708,7 +785,7 @@ function renderLive(){
   document.querySelectorAll('[data-lv="sattot"]').forEach(el=>{const s=d.st[el.dataset.id];if(s)el.textContent=fmt(d.now-s.played);});
   document.querySelectorAll('[data-lv="sit"]').forEach(el=>{const s=d.st[el.dataset.id];if(s)el.textContent=fmt(d.now-s.offAt);});
 }
-function renderAll(){renderGames();renderCtrl();renderClock();renderBanner();renderField();renderHint();renderPanel();}
+function renderAll(){renderSync();renderGames();renderCtrl();renderClock();renderBanner();renderField();renderHint();if(!(document.activeElement&&document.activeElement.id==='code'))renderPanel();}
 
 /* Clock loop */
 let lastSec=-1;
@@ -730,6 +807,7 @@ function tick(){
 }
 renderAll();
 setInterval(tick,250);
+syncInit();
 })();
 </script>
 </body>
